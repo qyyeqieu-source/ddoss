@@ -1,0 +1,10 @@
+*.o
+*.so
+*.a
+build/
+.env
+.DS_Store
+.idea/
+*.bak
+*.log
+.vscode/
