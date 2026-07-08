@@ -59,7 +59,7 @@ on:
 
 jobs:
   prepare:
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     outputs:
       matrix: ${{ steps.gen.outputs.matrix }}
       sync_ts: ${{ steps.sync.outputs.sync_ts }}
@@ -124,7 +124,7 @@ jobs:
 
   process:
     needs: [prepare]
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
     strategy:
       matrix: ${{ fromJSON(needs.prepare.outputs.matrix) }}
