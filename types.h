@@ -68,7 +68,9 @@ typedef struct {
     int port;
     char user[64];
     char pass[64];
+    char country[8];
     int has_auth;
+    int is_us;
     int fail_count;
     int success_count;
     int is_dead;
@@ -117,6 +119,7 @@ typedef struct {
     int is_xdp_filter;
     char xdp_interface[32];
     int is_dry_run;
+    int prefer_us_proxy;
 } Arguments;
 
 typedef struct Connection {
