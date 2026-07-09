@@ -120,6 +120,8 @@ typedef struct {
     char xdp_interface[32];
     int is_dry_run;
     int prefer_us_proxy;
+    int proxy_pool_id;
+    int proxy_pool_size;
 } Arguments;
 
 typedef struct Connection {
