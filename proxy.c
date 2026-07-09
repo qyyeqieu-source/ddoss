@@ -1,5 +1,17 @@
 #include "proxy.h"
 #include "logger.h"
+#include <strings.h>
+
+static int is_us_country(const char *country) {
+    if (!country || !*country) return 0;
+    char tmp[32];
+    size_t n = strlen(country);
+    if (n >= sizeof(tmp)) n = sizeof(tmp) - 1;
+    for (size_t i = 0; i < n; ++i) tmp[i] = tolower((unsigned char)country[i]);
+    tmp[n] = '\0';
+    return strstr(tmp, "us") != NULL || strstr(tmp, "usa") != NULL ||
+           strstr(tmp, "america") != NULL || strstr(tmp, "united states") != NULL;
+}
 
 void load_proxies(const char *filename) {
     FILE *fp = fopen(filename, "r");
@@ -21,6 +33,7 @@ void load_proxies(const char *filename) {
         char *p = strtok(NULL, ":\r\n");
         char *u = strtok(NULL, ":\r\n");
         char *pw = strtok(NULL, ":\r\n");
+        char *country = strtok(NULL, ":\r\n");
         if (!h || !p) continue;
         
         memset(&proxies[proxy_count], 0, sizeof(Proxy));
@@ -37,6 +50,11 @@ void load_proxies(const char *filename) {
             proxies[proxy_count].pass[sizeof(proxies[proxy_count].pass) - 1] = '\0';
             
             proxies[proxy_count].has_auth = 1;
+        }
+        if (country) {
+            strncpy(proxies[proxy_count].country, country, sizeof(proxies[proxy_count].country) - 1);
+            proxies[proxy_count].country[sizeof(proxies[proxy_count].country) - 1] = '\0';
+            proxies[proxy_count].is_us = is_us_country(proxies[proxy_count].country);
         }
         proxy_count++;
     }
