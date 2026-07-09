@@ -136,6 +136,9 @@ int main(int argc, char *argv[]) {
         if (strcmp(argv[i], "--dry-run") == 0) {
             args.is_dry_run = 1;
         }
+        if (strcmp(argv[i], "--prefer-us-proxy") == 0 || strcmp(argv[i], "--proxy-us") == 0) {
+            args.prefer_us_proxy = 1;
+        }
     }
     if (args.is_dry_run) {
         LOG_INFO("Running in DRY-RUN mode. Bypassing network interface, XDP loading, and network socket traffic.");
