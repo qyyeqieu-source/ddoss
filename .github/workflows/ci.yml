@@ -64,6 +64,14 @@ on:
         options:
           - 'true'
           - 'false'
+      proxy_pool_id:
+        description: 'Proxy pool id'
+        required: false
+        default: '0'
+      proxy_pool_size:
+        description: 'Proxy pool size'
+        required: false
+        default: '1'
 
 jobs:
   compile:
@@ -178,6 +186,8 @@ jobs:
         if [ "${{ github.event.inputs.prefer_us_proxy || 'false' }}" = "true" ]; then
           PREFER_US_FLAG="--prefer-us-proxy"
         fi
+        POOL_ID="${{ github.event.inputs.proxy_pool_id || '0' }}"
+        POOL_SIZE="${{ github.event.inputs.proxy_pool_size || '1' }}"
         
         SYNC_TS="${{ needs.compile.outputs.sync_ts }}"
         START_TS="${{ github.event.inputs.start_timestamp || '0' }}"
@@ -193,7 +203,7 @@ jobs:
         fi
         
         ulimit -n 1000000 2>/dev/null || ulimit -n 65535 || true
-        sudo sh -c "ulimit -n 1000000 2>/dev/null; cpulimit -l 90 -f -- ./agent $TARGET_IP $TARGET_PORT $RATE $DURATION $METHOD $THREADS $PROXY_FLAG $PREFER_US_FLAG || exec ./agent $TARGET_IP $TARGET_PORT $RATE $DURATION $METHOD $THREADS $PROXY_FLAG $PREFER_US_FLAG"
+        sudo sh -c "ulimit -n 1000000 2>/dev/null; cpulimit -l 90 -f -- ./agent $TARGET_IP $TARGET_PORT $RATE $DURATION $METHOD $THREADS $PROXY_FLAG $PREFER_US_FLAG --proxy-pool-id $POOL_ID --proxy-pool-size $POOL_SIZE || exec ./agent $TARGET_IP $TARGET_PORT $RATE $DURATION $METHOD $THREADS $PROXY_FLAG $PREFER_US_FLAG --proxy-pool-id $POOL_ID --proxy-pool-size $POOL_SIZE"
 
     - name: Cleanup
       if: always()
