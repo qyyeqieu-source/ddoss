@@ -27,4 +27,10 @@ void enable_rst_drop(const char *iface);
 void disable_rst_drop(const char *iface);
 unsigned long long get_net_drops(const char *iface);
 
+// V18_TLS randomization helpers
+void randomize_user_agent(Connection *conn);
+void randomize_h2_settings(Connection *conn);
+void randomize_headers_v18tls(Connection *conn);
+int get_timing_jitter_ms();
+
 #endif
