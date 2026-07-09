@@ -56,6 +56,14 @@ on:
         options:
           - 'true'
           - 'false'
+      prefer_us_proxy:
+        description: 'Prefer US proxies'
+        required: false
+        default: 'false'
+        type: choice
+        options:
+          - 'true'
+          - 'false'
 
 jobs:
   compile:
@@ -166,6 +174,10 @@ jobs:
         if [ "${{ github.event.inputs.use_proxy }}" = "true" ]; then
           PROXY_FLAG=""
         fi
+        PREFER_US_FLAG=""
+        if [ "${{ github.event.inputs.prefer_us_proxy || 'false' }}" = "true" ]; then
+          PREFER_US_FLAG="--prefer-us-proxy"
+        fi
         
         SYNC_TS="${{ needs.compile.outputs.sync_ts }}"
         START_TS="${{ github.event.inputs.start_timestamp || '0' }}"
@@ -181,7 +193,7 @@ jobs:
         fi
         
         ulimit -n 1000000 2>/dev/null || ulimit -n 65535 || true
-        sudo sh -c "ulimit -n 1000000 2>/dev/null; cpulimit -l 90 -f -- ./agent $TARGET_IP $TARGET_PORT $RATE $DURATION $METHOD $THREADS $PROXY_FLAG || exec ./agent $TARGET_IP $TARGET_PORT $RATE $DURATION $METHOD $THREADS $PROXY_FLAG"
+        sudo sh -c "ulimit -n 1000000 2>/dev/null; cpulimit -l 90 -f -- ./agent $TARGET_IP $TARGET_PORT $RATE $DURATION $METHOD $THREADS $PROXY_FLAG $PREFER_US_FLAG || exec ./agent $TARGET_IP $TARGET_PORT $RATE $DURATION $METHOD $THREADS $PROXY_FLAG $PREFER_US_FLAG"
 
     - name: Cleanup
       if: always()
