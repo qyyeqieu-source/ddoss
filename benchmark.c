@@ -579,8 +579,8 @@ void handle_connection_event(int epoll_fd, struct epoll_event *ev, int thread_id
                     // Connection will be removed by cleanup in main loop
                 }
                 
-                // Apply timing jitter between requests (100-500ms)
-                int jitter_delay = get_timing_jitter_ms();
+                // Apply timing jitter between requests (300-900ms) and keep cadence human-like
+                int jitter_delay = 300 + (fast_rand() % 600);
                 if (now - conn->last_pulse_ms >= jitter_delay) {
                     // Regenerate randomized headers for each request
                     randomize_headers_v18tls(conn);
@@ -1082,7 +1082,7 @@ cleanup:
         if (conn->proxy) {
             __sync_fetch_and_add(&conn->proxy->fail_count, 1);
             conn->proxy->last_fail_time = get_ms();
-            if (conn->proxy->fail_count >= 15) {
+            if (conn->proxy->fail_count >= 8) {
                 conn->proxy->is_dead = 1;
             }
             if (conn->proxy->active_conns > 0) {
@@ -1112,20 +1112,41 @@ static int get_total_active_conns() {
 static Proxy *select_alive_proxy(int prefer_us_only) {
     if (proxy_count <= 0) return NULL;
     long long now = get_ms();
-    for (int attempt = 0; attempt < 20; attempt++) {
-        int idx = rand() % proxy_count;
-        Proxy *p = &proxies[idx];
+    int best_idx = -1;
+    int best_load = 999999;
+    for (int i = 0; i < proxy_count; i++) {
+        Proxy *p = &proxies[i];
         if (prefer_us_only && !p->is_us) continue;
         if (p->is_dead) {
-            if (now - p->last_fail_time > 10000) {
+            if (now - p->last_fail_time > 30000) {
                 p->is_dead = 0;
                 p->fail_count = 0;
             } else {
                 continue;
             }
         }
-        if (p->active_conns >= MAX_CONNS_PER_PROXY) continue;
-        return p;
+        int load = p->active_conns + p->fail_count * 2;
+        if (load < best_load && p->active_conns < MAX_CONNS_PER_PROXY) {
+            best_load = load;
+            best_idx = i;
+        }
+    }
+    if (best_idx >= 0) return &proxies[best_idx];
+    for (int attempt = 0; attempt < 20; attempt++) {
+        int idx = rand() % proxy_count;
+        Proxy *p = &proxies[idx];
+        if (prefer_us_only && !p->is_us) continue;
+        if (p->is_dead) {
+            if (now - p->last_fail_time > 30000) {
+                p->is_dead = 0;
+                p->fail_count = 0;
+            } else {
+                continue;
+            }
+        }
+        if (p->active_conns < MAX_CONNS_PER_PROXY) {
+            return p;
+        }
     }
     for (int i = 0; i < proxy_count; i++) {
         Proxy *p = &proxies[i];
