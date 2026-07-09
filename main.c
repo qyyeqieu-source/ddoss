@@ -139,12 +139,19 @@ int main(int argc, char *argv[]) {
         if (strcmp(argv[i], "--prefer-us-proxy") == 0 || strcmp(argv[i], "--proxy-us") == 0) {
             args.prefer_us_proxy = 1;
         }
+        if (strcmp(argv[i], "--proxy-pool-id") == 0 && i + 1 < argc) {
+            args.proxy_pool_id = atoi(argv[++i]);
+        }
+        if (strcmp(argv[i], "--proxy-pool-size") == 0 && i + 1 < argc) {
+            args.proxy_pool_size = atoi(argv[++i]);
+        }
     }
     if (args.is_dry_run) {
         LOG_INFO("Running in DRY-RUN mode. Bypassing network interface, XDP loading, and network socket traffic.");
     }
     if (use_proxies) {
         load_proxies("proxies.txt");
+        apply_proxy_pool_filter();
     } else {
         LOG_INFO("Bypassing proxies.txt as requested by --no-proxies");
     }
