@@ -50,7 +50,7 @@ static inline unsigned int xorshift32(void) {
 #define BUFFER_POOL_SIZE (1024 * 1024 * 32)
 #define PULSE_INTERVAL_MS 50 
 #define MAX_HTTP2_STREAMS 1000
-#define MAX_CONNS_PER_PROXY 10
+#define MAX_CONNS_PER_PROXY 4
 
 #define STAGE_CONNECTING 0
 #define STAGE_SOCKS_GREET 1
