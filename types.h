@@ -59,38 +59,9 @@ static inline unsigned int xorshift32(void) {
 #define STAGE_TLS_HANDSHAKE 4
 #define STAGE_H2_PREFACE 5
 #define STAGE_ATTACKING 6
-#define STAGE_CLOSED 7
 
 #define PAYLOAD_CACHE_COUNT 64
 #define STABLE_PAYLOAD_SIZE 524288
-#define USER_AGENT_COUNT 12
-#define H2_SETTINGS_VARIANTS 8
-
-// User-Agent pool for randomization
-static const char *user_agent_pool[USER_AGENT_COUNT] = {
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:123.0) Gecko/20100101 Firefox/123.0",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2.1 Safari/605.1.15",
-    "Mozilla/5.0 (X11; Linux x86_64; rv:123.0) Gecko/20100101 Firefox/123.0",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36 Edg/124.0.0.0",
-    "Mozilla/5.0 (iPhone; CPU iPhone OS 17_2_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Mobile/15E148 Safari/604.1",
-    "Mozilla/5.0 (iPad; CPU OS 17_2_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Mobile/15E148 Safari/604.1",
-    "Mozilla/5.0 (Linux; Android 14; SM-S911B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:123.0) Gecko/20100101 Firefox/123.0"
-};
-
-// Accept-Language variants for randomization
-static const char *accept_language_pool[] = {
-    "en-US,en;q=0.9",
-    "en-US,en;q=0.9,es;q=0.8",
-    "en-US,en;q=0.9,fr;q=0.8",
-    "en-US,en;q=0.9,de;q=0.8",
-    "en-US,en;q=0.9,ja;q=0.8",
-    "en;q=0.9,en-US;q=0.8"
-};
 
 typedef struct {
     char host[128];
@@ -175,11 +146,6 @@ typedef struct Connection {
     int is_udp_assoc;
     struct sockaddr_in udp_relay_addr;
     int client_udp_fd;
-    int requests_on_conn;        // Track requests on this connection
-    int max_requests_per_conn;   // Max before reconnect (5-15)
-    int h2_settings_variant;     // Which H2 settings randomization
-    unsigned char h2_settings[32]; // Randomized H2 settings
-    int h2_settings_len;
     struct Connection *next;
     struct Connection *prev;
 } Connection;
